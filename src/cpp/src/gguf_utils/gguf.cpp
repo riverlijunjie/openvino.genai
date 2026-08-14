@@ -90,8 +90,7 @@ ov::Tensor extract_tensor_data(gguf_tensor* tensor) {
         memcpy(weights.data(), tensor->weights_data, tensor->num_weights * equivalent_dtype.value().size());
         return weights;
     }
-    // Otherwise, we convert to float16.
-    // TODO: Add other dequantization options.
+    // Otherwise, materialize the tensor as float16; this loader has no other fallback precision.
     int16_t* data = gguf_tensor_to_f16(tensor);
     OPENVINO_ASSERT(data != nullptr, "[load_gguf] gguf_tensor_to_f16 failed");
 
@@ -103,6 +102,7 @@ ov::Tensor extract_tensor_data(gguf_tensor* tensor) {
 
     return weights;
 }
+
 
 void set_value_from_gguf(gguf_ctx* ctx, uint32_t type, gguf_value* val, GGUFMetaData& value) {
     switch (type) {
@@ -319,7 +319,7 @@ std::vector<std::string> get_all_files(std::string file, int total_num) {
     return files;
 }
 
-GGUFLoad get_gguf_data(const std::string& file) {
+GGUFLoad get_gguf_data(const std::string& file, bool is_tokenizer) {
     std::unordered_map<std::string, ov::Tensor> arrays;
     std::unordered_map<std::string, gguf_tensor_type> qtype;
 
@@ -330,6 +330,10 @@ GGUFLoad get_gguf_data(const std::string& file) {
 
     // get main config from first file or single file
     auto metadata = load_metadata(ctx.get());
+
+    if (is_tokenizer) {
+        return {metadata, arrays, qtype};
+    }
 
     std::string split_flag = "split.count";
     auto it = metadata.find(split_flag);

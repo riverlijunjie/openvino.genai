@@ -5,10 +5,15 @@
 #include "model_desc.hpp"
 
 #include <algorithm>
-#include <variant>
+#include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <memory>
+#include <mutex>
+#include <variant>
 
+#include "gguf_utils/gguf_modeling.hpp"
+#include "model_desc.hpp"
 #include "openvino/runtime/properties.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/divide.hpp"
@@ -19,8 +24,11 @@
 #include "openvino/op/tanh.hpp"
 #include "openvino/op/transpose.hpp"
 #include "openvino/genai/text_streamer.hpp"
-#include "gguf_utils/gguf_modeling.hpp"
 
+#ifdef ENABLE_GGUF
+#include <ov_ops/fully_connected_compressed.hpp>
+#include <ov_ops/moe_compressed.hpp>
+#endif
 
 #include "sampling/sampler.hpp"
 
@@ -33,6 +41,17 @@ const std::string SDPA_BACKEND = "SDPA";
 }
 
 namespace {
+
+void register_gguf_ir_deserialization_extensions(ov::Core& core) {
+#ifdef ENABLE_GGUF
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        core.add_extension(std::make_shared<ov::OpExtension<ov::op::internal::MOECompressed>>());
+    });
+#else
+    (void)core;
+#endif
+}
 
 void update_config(ov::AnyMap& config, const std::pair<std::string, ov::Any>& pair) {
     if (config.count(pair.first) == 0) {
@@ -283,7 +302,23 @@ bool has_op_with_type(const std::shared_ptr<const ov::Model>& function, const st
 
 std::tuple<std::shared_ptr<ov::Node>, int64_t> find_llm_matmul(const std::shared_ptr<ov::Model>& model) {
     auto last_node = model->output(0).get_node()->input_value(0).get_node_shared_ptr();
-    std::shared_ptr<ov::Node> matmul = ov::as_type_ptr<ov::op::v0::MatMul>(last_node);
+
+    // The final projection is a plain MatMul for optimum/NNCF models, but the native GGUF
+    // frontend emits a FullyConnectedCompressed (weight-only-quantized LM head). Both expose
+    // the activation on input(0), so the last-token slice/gather applies identically.
+    auto as_llm_matmul = [](const std::shared_ptr<ov::Node>& n) -> std::shared_ptr<ov::Node> {
+        if (ov::as_type_ptr<ov::op::v0::MatMul>(n)) {
+            return n;
+        }
+#ifdef ENABLE_GGUF
+        if (ov::as_type_ptr<ov::op::internal::FullyConnectedCompressed>(n)) {
+            return n;
+        }
+#endif
+        return nullptr;
+    };
+
+    std::shared_ptr<ov::Node> matmul = as_llm_matmul(last_node);
 
     // in case of PA all tokens are moved to batch dimension and we have to slice / gather accordingly
     const bool pa_based_model = has_op_with_type(model, "PagedAttentionExtension");
@@ -296,15 +331,16 @@ std::tuple<std::shared_ptr<ov::Node>, int64_t> find_llm_matmul(const std::shared
     // MatMul -> Divide -> Tanh -> Multiply -> Result
     if (!matmul) {
         if (auto add = ov::as_type_ptr<ov::op::v1::Add>(last_node)) {
-            matmul = ov::as_type_ptr<ov::op::v0::MatMul>(add->input_value(0).get_node_shared_ptr());
+            matmul = as_llm_matmul(add->input_value(0).get_node_shared_ptr());
         } else if (auto transpose = ov::as_type_ptr<ov::op::v1::Transpose>(last_node)) {
-            matmul = ov::as_type_ptr<ov::op::v0::MatMul>(transpose->input_value(0).get_node_shared_ptr());
-            auto order = ov::as_type_ptr<ov::op::v0::Constant>(transpose->input_value(1).get_node_shared_ptr())->get_axis_vector_val();
+            matmul = as_llm_matmul(transpose->input_value(0).get_node_shared_ptr());
+            auto order = ov::as_type_ptr<ov::op::v0::Constant>(transpose->input_value(1).get_node_shared_ptr())
+                             ->get_axis_vector_val();
             slice_gather_dim = order[slice_gather_dim];
         } else if (auto multiply = ov::as_type_ptr<ov::op::v1::Multiply>(last_node)) {
             if (auto tanh = ov::as_type_ptr<ov::op::v0::Tanh>(multiply->input_value(0).get_node_shared_ptr())) {
                 if (auto divide = ov::as_type_ptr<ov::op::v1::Divide>(tanh->input_value(0).get_node_shared_ptr())) {
-                    matmul = as_type_ptr<ov::op::v0::MatMul>(divide->input_value(0).get_node_shared_ptr());
+                    matmul = as_llm_matmul(divide->input_value(0).get_node_shared_ptr());
                 }
             }
         }
@@ -346,7 +382,12 @@ void apply_gather_before_matmul_transformation(std::shared_ptr<ov::Model> model)
 }
 
 ov::Core& singleton_core() {
-    static ov::Core core;
+    static ov::Core core = []() {
+        ov::Core core;
+        core.get_versions("CPU");
+        register_gguf_ir_deserialization_extensions(core);
+        return core;
+    }();
     return core;
 }
 
@@ -355,6 +396,17 @@ namespace {
 bool is_gguf_model(const std::filesystem::path& file_path) {
     return file_path.extension() == ".gguf";
 }
+
+int64_t elapsed_ms(const std::chrono::steady_clock::time_point& start,
+                   const std::chrono::steady_clock::time_point& end) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+}
+
+#ifdef ENABLE_SAFETENSORS
+bool is_safetensors_model_dir(const std::filesystem::path& model_dir) {
+    return ov::genai::safetensors::is_safetensors_model(model_dir);
+}
+#endif
 
 } // namespace
 
@@ -438,24 +490,152 @@ void save_openvino_model(const std::shared_ptr<ov::Model>& model, const std::str
 std::shared_ptr<ov::Model> read_model(const std::filesystem::path& model_dir,  const ov::AnyMap& properties) {
     auto [filtered_properties, enable_save_ov_model] = extract_gguf_properties(properties);
     if (is_gguf_model(model_dir)) {
-#ifdef ENABLE_GGUF
-        return create_from_gguf(model_dir.string(), enable_save_ov_model);
-#else
-        OPENVINO_ASSERT("GGUF support is switched off. Please, recompile with 'cmake -DENABLE_GGUF=ON'");
-#endif
-    } else {
-        std::filesystem::path model_path = model_dir;
+        const auto gguf_flow_start = std::chrono::steady_clock::now();
+        const bool enable_gguf_ir_xml = env_bool("OPENVINO_GENAI_GGUF_IR_CACHE", /*default=*/true);
 
-        if (std::filesystem::exists(model_dir / "openvino_model.xml")) {
-            model_path = model_dir / "openvino_model.xml";
-        } else if (std::filesystem::exists(model_dir / "openvino_language_model.xml")) {
-            model_path = model_path / "openvino_language_model.xml";
+        // Portable paired-model discovery: a GGUF `foo.gguf` is paired with a sibling `foo.xml`
+        // holding the OpenVINO graph plus external weight references back into the GGUF. The XML
+        // does not duplicate the GGUF block weights into its .bin; they are memory-mapped from the
+        // sibling GGUF at load time. Copying `foo.xml` + `foo.gguf` to any directory/machine works.
+        std::filesystem::path gguf_path = model_dir;
+        std::filesystem::path xml_path = gguf_path;
+        xml_path.replace_extension(".xml");
+
+        print_gguf_debug_info("GGUF load begin: model='" + model_dir.string() + "'");
+        if (!enable_gguf_ir_xml) {
+            print_gguf_debug_info("GGUF IR XML is disabled via OPENVINO_GENAI_GGUF_IR_CACHE=0; skip sibling xml read/write.");
         } else {
-            OPENVINO_THROW("Could not find a model in the directory '", model_dir, "'");
+            print_gguf_debug_info("GGUF sibling XML candidate: '" + xml_path.string() + "'");
         }
 
-        return singleton_core().read_model(model_path, {}, filtered_properties);
+        const bool xml_exists = enable_gguf_ir_xml && std::filesystem::exists(xml_path);
+
+        if (xml_exists) {
+            try {
+                const auto read_start = std::chrono::steady_clock::now();
+                auto model = singleton_core().read_model(xml_path, {}, filtered_properties);
+                const auto read_end = std::chrono::steady_clock::now();
+                print_gguf_debug_info("Loaded model from sibling XML + GGUF weights: " + xml_path.string() +
+                                      ", read_time=" + std::to_string(elapsed_ms(read_start, read_end)) + " ms" +
+                                      ", total_gguf_read_model_time=" +
+                                      std::to_string(elapsed_ms(gguf_flow_start, read_end)) + " ms");
+                return model;
+            } catch (const ov::Exception& e) {
+                print_gguf_debug_info("Failed to read sibling XML '" + xml_path.string() + "': " + std::string(e.what()) +
+                                      ". Falling back to direct GGUF loading.");
+            }
+        }
+
+        std::shared_ptr<ov::Model> gguf_model;
+
+        // The openvino GGUF FrontEnd in this build (river/native_gguf_support) only acts as a
+        // weight mmap reader for the gguf+xml path: its FrontEnd::convert() explicitly throws when
+        // called with a raw .gguf path. Graph construction must always go through the genai
+        // in-tree GGUF builder (create_from_gguf), which saves an XML with external-weight
+        // references back to the .gguf; subsequent loads of that XML let the FE handle weight
+        // mmap automatically.
+        //
+        // OPENVINO_GENAI_USE_NATIVE_GGUF_FE: kept for forward-compatibility; if a future openvino
+        // build supports direct GGUF->model conversion the try/catch will remove itself. Default
+        // is false to avoid the known-failing direct path.
+        const bool use_native_fe = env_bool("OPENVINO_GENAI_USE_NATIVE_GGUF_FE", /*default=*/false);
+        const auto gguf_frontend_read_start = std::chrono::steady_clock::now();
+        bool used_native_fe = false;
+        if (use_native_fe) {
+            // Attempt direct GGUF->model via native FE.  The current openvino GGUF FE throws
+            // in convert(); catch the error and fall back to the legacy builder so the user
+            // doesn't need to unset OPENVINO_GENAI_USE_NATIVE_GGUF_FE manually.
+            try {
+                gguf_model = singleton_core().read_model(model_dir, {}, filtered_properties);
+                used_native_fe = true;
+            } catch (const ov::Exception& e) {
+                print_gguf_debug_info(std::string("Native GGUF FE refused direct conversion: ") +
+                                      e.what() + ". Falling back to legacy GGUF builder.");
+#ifdef ENABLE_GGUF
+                gguf_model = create_from_gguf(model_dir.string(), enable_save_ov_model);
+#else
+                OPENVINO_THROW("[GGUF] Native FE unavailable and ENABLE_GGUF is OFF. "
+                               "Cannot load model.");
+#endif
+            }
+        } else {
+#ifdef ENABLE_GGUF
+            gguf_model = create_from_gguf(model_dir.string(), enable_save_ov_model);
+#else
+            OPENVINO_ASSERT("GGUF support is switched off. Please, recompile with 'cmake -DENABLE_GGUF=ON'");
+#endif
+        }
+        const auto gguf_frontend_read_end = std::chrono::steady_clock::now();
+        print_gguf_debug_info(std::string("Loaded model directly from GGUF via ") +
+                              (used_native_fe ? "native FE" : "legacy GGUF loader") +
+                              ", time=" + std::to_string(elapsed_ms(gguf_frontend_read_start, gguf_frontend_read_end)) + " ms");
+
+        // First load: generate the sibling XML next to the GGUF so subsequent loads skip graph
+        // construction. The genai in-tree builder (create_from_gguf) emits gguf_ext_* Constant
+        // rt-info that enables external-weight serialization, so XML generation works for both
+        // paths.
+        if (enable_gguf_ir_xml) {
+            try {
+                const auto save_start = std::chrono::steady_clock::now();
+                // compress_to_fp16=false: keep host-materialized constants (e.g. dequantized
+                // embeddings) unchanged; GGUF block weights are emitted as external references and
+                // are not written into the .bin regardless.
+                ov::save_model(gguf_model, xml_path.string(), /*compress_to_fp16=*/false);
+                const auto save_end = std::chrono::steady_clock::now();
+                print_gguf_debug_info("Saved sibling GGUF graph XML: " + xml_path.string() +
+                                      ", save_time=" + std::to_string(elapsed_ms(save_start, save_end)) + " ms");
+
+                // Reload from the freshly written XML so the cold path returns the same deserialized
+                // form (GGUF weights mmap'd via external references) as subsequent warm loads. Opt
+                // out with OPENVINO_GENAI_GGUF_CACHE_RELOAD_AFTER_SAVE=0.
+                const bool reload_after_save = env_bool("OPENVINO_GENAI_GGUF_CACHE_RELOAD_AFTER_SAVE", /*default=*/true);
+                if (reload_after_save) {
+                    const auto reload_start = std::chrono::steady_clock::now();
+                    auto reloaded_model = singleton_core().read_model(xml_path, {}, filtered_properties);
+                    const auto reload_end = std::chrono::steady_clock::now();
+                    print_gguf_debug_info("Reloaded model from sibling XML after save: " + xml_path.string() +
+                                          ", reload_time=" + std::to_string(elapsed_ms(reload_start, reload_end)) + " ms" +
+                                          ", total_gguf_read_model_time=" +
+                                          std::to_string(elapsed_ms(gguf_flow_start, reload_end)) + " ms");
+                    return reloaded_model;
+                }
+            } catch (const ov::Exception& e) {
+                print_gguf_debug_info("Failed to persist/reload sibling GGUF graph XML: " + std::string(e.what()) +
+                                      ". Continue with directly loaded GGUF model.");
+            }
+        }
+
+        print_gguf_debug_info("GGUF load end (return direct model), total_gguf_read_model_time=" +
+                              std::to_string(elapsed_ms(gguf_flow_start, std::chrono::steady_clock::now())) + " ms");
+
+        return gguf_model;
     }
+    
+#ifdef ENABLE_SAFETENSORS
+    // Check if directory contains safetensors model (before checking for OpenVINO IR)
+    if (std::filesystem::is_directory(model_dir) && is_safetensors_model_dir(model_dir)) {
+        // If OpenVINO model already exists, use it; otherwise create from safetensors
+        if (!std::filesystem::exists(model_dir / "openvino_model.xml")) {
+             ov::genai::modeling::weights::QuantizationConfig q_conf;
+             if (quant_config.has_value()) {
+                 q_conf = *quant_config;
+             }
+            return ov::genai::safetensors::create_from_safetensors(model_dir, enable_save_ov_model, q_conf);
+        }
+    }
+#endif
+
+    std::filesystem::path model_path = model_dir;
+
+    if (std::filesystem::exists(model_dir / "openvino_model.xml")) {
+        model_path = model_dir / "openvino_model.xml";
+    } else if (std::filesystem::exists(model_dir / "openvino_language_model.xml")) {
+        model_path = model_path / "openvino_language_model.xml";
+    } else {
+        OPENVINO_THROW("Could not find a model in the directory '", model_dir, "'");
+    }
+
+    return singleton_core().read_model(model_path, {}, filtered_properties);
 }
 
 size_t get_first_history_difference(const ov::Tensor& encoded_history, const std::vector<int64_t> tokenized_history) {
@@ -613,6 +793,24 @@ bool env_setup_for_print_debug_info() {
     const char* env_var_value = std::getenv(env_var_name);
     // Check if the environment variable was found
     return (env_var_value != nullptr && atoi(env_var_value) > static_cast<int>(ov::log::Level::WARNING));
+}
+
+bool env_bool(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return default_value;
+    }
+    std::string v(value);
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (v == "0" || v == "false" || v == "off" || v == "no") {
+        return false;
+    }
+    if (v == "1" || v == "true" || v == "on" || v == "yes") {
+        return true;
+    }
+    return default_value;
 }
 
 void print_compiled_model_properties(ov::CompiledModel& compiled_Model, const char* model_title) {

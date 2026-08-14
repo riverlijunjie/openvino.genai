@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include "openvino/core/visibility.hpp"
+#include "openvino/runtime/properties.hpp"
 #include "openvino/genai/llm_pipeline.hpp"
 #include "openvino/genai/perf_metrics.hpp"
 #include "openvino/genai/text_streamer.hpp"
@@ -21,6 +22,15 @@
 #include "logger.hpp"
 
 namespace {
+
+ov::AnyMap with_cache_model_path_if_possible(const ov::AnyMap& properties,
+                                             const std::filesystem::path& models_path) {
+    ov::AnyMap updated = properties;
+    if (!models_path.empty() && updated.find(ov::cache_model_path.name()) == updated.end()) {
+        updated[ov::cache_model_path.name()] = models_path;
+    }
+    return updated;
+}
 
 void log_paged_attention_fallback(const ov::Exception& exception) {
     GENAI_WARN("Paged Attention backend initialization failed. Falling back to SDPA backend. "
@@ -163,7 +173,7 @@ static std::unique_ptr<LLMPipelineImplBase> create(
     return create(ov::genai::utils::read_model(models_path, properties),
                   tokenizer,
                   device,
-                  properties,
+                  with_cache_model_path_if_possible(properties, models_path),
                   utils::from_config_json_if_exists(models_path),
                   models_path);
 }
@@ -182,7 +192,7 @@ static std::unique_ptr<LLMPipelineImplBase> create(const std::shared_ptr<ov::Mod
                                                    const ov::genai::GenerationConfig& generation_config,
                                                    const std::filesystem::path& models_path = {}) {
     OPENVINO_ASSERT(model, "Model must not be null");
-    auto properties_without_draft_model = properties;
+    auto properties_without_draft_model = with_cache_model_path_if_possible(properties, models_path);
     auto draft_model_descr = ov::genai::extract_draft_model_from_config(properties_without_draft_model);
 
     auto main_model_descr =

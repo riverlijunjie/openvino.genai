@@ -3,14 +3,102 @@
 
 #include "tokenizer/tokenizer_impl.hpp"
 
+#include <optional>
 #include <utility>
 
 #include "add_second_input_pass.hpp"
+#include "openvino/runtime/properties.hpp"
 #include "sampling/structured_output/structured_output_controller.hpp"
 #include "openvino/genai/version.hpp"
 
 namespace ov {
 namespace genai {
+
+namespace {
+
+uint64_t fnv1a64_hash(const std::string& value) {
+    constexpr uint64_t fnv_offset_basis = 14695981039346656037ULL;
+    constexpr uint64_t fnv_prime = 1099511628211ULL;
+
+    uint64_t hash = fnv_offset_basis;
+    for (unsigned char c : value) {
+        hash ^= static_cast<uint64_t>(c);
+        hash *= fnv_prime;
+    }
+    return hash;
+}
+
+std::string to_hex_64(uint64_t value) {
+    static const char* hex_chars = "0123456789abcdef";
+    std::string out(16, '0');
+    for (int i = 15; i >= 0; --i) {
+        out[i] = hex_chars[value & 0xF];
+        value >>= 4;
+    }
+    return out;
+}
+
+std::string build_gguf_model_cache_key(const std::filesystem::path& gguf_path) {
+    std::string key_material;
+    try {
+        key_material = std::filesystem::weakly_canonical(gguf_path).string();
+    } catch (...) {
+        key_material = gguf_path.string();
+    }
+
+    try {
+        if (std::filesystem::exists(gguf_path)) {
+            key_material += "|size=" + std::to_string(std::filesystem::file_size(gguf_path));
+            key_material += "|mtime=" + std::to_string(std::filesystem::last_write_time(gguf_path).time_since_epoch().count());
+        }
+    } catch (...) {
+        // Keep key based on the path only if file metadata is unavailable.
+    }
+
+    return to_hex_64(fnv1a64_hash(key_material));
+}
+
+std::optional<std::filesystem::path> extract_cache_dir(const ov::AnyMap& properties) {
+    auto it = properties.find(ov::cache_dir.name());
+    if (it == properties.end()) {
+        it = properties.find("cache_dir");
+    }
+    if (it == properties.end() || it->second.empty()) {
+        return std::nullopt;
+    }
+
+    if (it->second.is<std::filesystem::path>()) {
+        auto path = it->second.as<std::filesystem::path>();
+        if (!path.empty()) {
+            return path;
+        }
+    } else if (it->second.is<std::string>()) {
+        auto path = std::filesystem::path(it->second.as<std::string>());
+        if (!path.empty()) {
+            return path;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::filesystem::path gguf_cached_artifact_dir(const std::filesystem::path& cache_dir,
+                                               const std::filesystem::path& gguf_path) {
+    return cache_dir / "gguf_ir" / build_gguf_model_cache_key(gguf_path);
+}
+
+std::filesystem::path xml_to_bin_path(std::filesystem::path xml_path) {
+    xml_path.replace_extension(".bin");
+    return xml_path;
+}
+
+std::pair<bool, bool> ir_pair_presence(const std::filesystem::path& xml_path) {
+    const bool xml_exists = std::filesystem::exists(xml_path);
+    const bool bin_exists = std::filesystem::exists(xml_to_bin_path(xml_path));
+    return {xml_exists, bin_exists};
+}
+
+}  // namespace
 
 void check_arguments(const ov::AnyMap& parameters, std::set<std::string> allowed_argnames) {
     for (const auto& [key, value] : parameters) {
@@ -247,6 +335,8 @@ Tokenizer::TokenizerImpl::TokenizerImpl(const std::pair<std::shared_ptr<ov::Mode
 void filter_properties(ov::AnyMap& properties) {
     // Properties allowed for tokenizer/detokenizer on CPU
     std::set<std::string> allowed_argnames = {
+        ov::cache_dir.name(),
+        "cache_dir",
         ov::hint::performance_mode.name(),
         ov::hint::num_requests.name(),
         ov::hint::enable_cpu_pinning.name(),
@@ -290,6 +380,46 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
     auto [filtered_properties, enable_save_ov_model] = utils::extract_gguf_properties(properties);
     
     if (ov::genai::is_gguf_model(models_path)) {
+        const std::filesystem::path gguf_model_path(models_path);
+        const bool enable_gguf_ir_cache = ov::genai::utils::env_bool("OPENVINO_GENAI_GGUF_IR_CACHE", /*default=*/true);
+        const auto cache_dir = enable_gguf_ir_cache ? extract_cache_dir(filtered_properties)
+                                                    : std::optional<std::filesystem::path>{};
+        const auto cache_export_dir = cache_dir.has_value()
+            ? std::optional<std::filesystem::path>(gguf_cached_artifact_dir(*cache_dir, gguf_model_path))
+            : std::nullopt;
+        const auto legacy_export_dir = gguf_model_path.parent_path();
+
+        auto try_load_exported = [&](const std::filesystem::path& export_dir) -> bool {
+            const auto tokenizer_xml = export_dir / "openvino_tokenizer.xml";
+            const auto detokenizer_xml = export_dir / "openvino_detokenizer.xml";
+            const auto [tok_xml_exists, tok_bin_exists] = ir_pair_presence(tokenizer_xml);
+            const auto [detok_xml_exists, detok_bin_exists] = ir_pair_presence(detokenizer_xml);
+            const bool hit = (tok_xml_exists && tok_bin_exists && detok_xml_exists && detok_bin_exists);
+
+            if (!hit) {
+                return false;
+            }
+
+            try {
+                ov_tokenizer = core.read_model(tokenizer_xml, {}, std::as_const(filtered_properties));
+                ov_detokenizer = core.read_model(detokenizer_xml, {}, std::as_const(filtered_properties));
+                setup_tokenizer(std::make_pair(ov_tokenizer, ov_detokenizer), filtered_properties);
+                return true;
+            } catch (const std::exception&) {
+                ov_tokenizer = nullptr;
+                ov_detokenizer = nullptr;
+                return false;
+            }
+        };
+
+        if (cache_export_dir.has_value() && try_load_exported(*cache_export_dir)) {
+            return;
+        }
+
+        if (try_load_exported(legacy_export_dir)) {
+            return;
+        }
+
         std::map<std::string, GGUFMetaData> tokenizer_config{};
         std::tie(ov_tokenizer, ov_detokenizer, tokenizer_config) =
             create_tokenizer_from_config(m_shared_object_ov_tokenizers, models_path);
@@ -313,22 +443,38 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::filesystem::path& mode
         ov_tokenizer->set_rt_info(ov::genai::get_version().buildNumber, "openvino_genai_version");
         ov_detokenizer->set_rt_info(ov::genai::get_version().buildNumber, "openvino_genai_version");
 
-        if (enable_save_ov_model){
-            std::filesystem::path gguf_model_path(models_path);
-            std::filesystem::path save_ov_tokenizer_path = gguf_model_path.parent_path() / "openvino_tokenizer.xml";
-            std::filesystem::path save_ov_detokenizer_path = gguf_model_path.parent_path() / "openvino_detokenizer.xml";
-            ov_tokenizer->set_rt_info(m_pad_token_id, "pad_token_id");
-            ov_tokenizer->set_rt_info(m_bos_token_id, "bos_token_id");
-            ov_tokenizer->set_rt_info(m_eos_token_id, "eos_token_id");
-            ov_tokenizer->set_rt_info(m_chat_template, "chat_template");
+        ov_tokenizer->set_rt_info(m_pad_token_id, "pad_token_id");
+        ov_tokenizer->set_rt_info(m_bos_token_id, "bos_token_id");
+        ov_tokenizer->set_rt_info(m_eos_token_id, "eos_token_id");
+        ov_tokenizer->set_rt_info(m_chat_template, "chat_template");
 
-            ov_detokenizer->set_rt_info(m_pad_token_id, "pad_token_id");
-            ov_detokenizer->set_rt_info(m_bos_token_id, "bos_token_id");
-            ov_detokenizer->set_rt_info(m_eos_token_id, "eos_token_id");
-            ov_detokenizer->set_rt_info(m_chat_template, "chat_template");
+        ov_detokenizer->set_rt_info(m_pad_token_id, "pad_token_id");
+        ov_detokenizer->set_rt_info(m_bos_token_id, "bos_token_id");
+        ov_detokenizer->set_rt_info(m_eos_token_id, "eos_token_id");
+        ov_detokenizer->set_rt_info(m_chat_template, "chat_template");
 
-            ov::genai::utils::save_openvino_model(ov_tokenizer, save_ov_tokenizer_path.string(), false);
-            ov::genai::utils::save_openvino_model(ov_detokenizer, save_ov_detokenizer_path.string(), false);
+        auto save_tokenizer_pair = [&](const std::filesystem::path& export_dir) {
+            std::filesystem::create_directories(export_dir);
+            const auto save_tok_path = export_dir / "openvino_tokenizer.xml";
+            const auto save_detok_path = export_dir / "openvino_detokenizer.xml";
+            ov::genai::utils::save_openvino_model(ov_tokenizer, save_tok_path.string(), false);
+            ov::genai::utils::save_openvino_model(ov_detokenizer, save_detok_path.string(), false);
+        };
+
+        if (cache_export_dir.has_value()) {
+            try {
+                save_tokenizer_pair(*cache_export_dir);
+            } catch (const std::exception&) {
+                // Best-effort export to cache_dir; ignore failures.
+            }
+        }
+
+        if (enable_save_ov_model) {
+            try {
+                save_tokenizer_pair(legacy_export_dir);
+            } catch (const std::exception&) {
+                // Best-effort export to model_dir; ignore failures.
+            }
         }
 
         setup_tokenizer(std::make_pair(ov_tokenizer, ov_detokenizer), filtered_properties);
@@ -446,6 +592,11 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::pair<std::shared_ptr<o
             req.set_callback([queue = m_ireq_queue_tokenizer.get(), idx, warmup_text, &req](std::exception_ptr) {
                 // this empty placeholder keeps input data alive until request is finished
                 (void) warmup_text;
+                try {
+                    req.reset_state();
+                } catch (...) {
+                    // Best-effort cleanup for stateful tokenizers.
+                }
                 queue->return_to(idx);
                 req.set_callback({});
 
@@ -491,6 +642,11 @@ void Tokenizer::TokenizerImpl::setup_tokenizer(const std::pair<std::shared_ptr<o
             req.set_callback([queue = m_ireq_queue_detokenizer.get(), idx, warmup_tokens, &req](std::exception_ptr) {
                 // this empty placeholder keeps input data alive until request is finished
                 (void) warmup_tokens;
+                try {
+                    req.reset_state();
+                } catch (...) {
+                    // Best-effort cleanup for stateful detokenizers.
+                }
                 queue->return_to(idx);
                 req.set_callback({});
             });

@@ -18,6 +18,11 @@ bool is_gguf_model(const std::filesystem::path& file_path);
 std::map<std::string, GGUFMetaData> tokenizer_config_from_meta(
     const std::unordered_map<std::string, GGUFMetaData>& metadata);
 
+/// @brief Build the tokenizer config map from the native GGUF FrontEnd rt-info schema
+/// carried on the ov::Model produced by Core::read_model("*.gguf"),
+/// instead of re-parsing the .gguf file's metadata dictionary.
+std::map<std::string, GGUFMetaData> tokenizer_config_from_meta(const ov::Model& model);
+
 std::tuple<std::shared_ptr<ov::Model>, std::shared_ptr<ov::Model>, std::map<std::string, GGUFMetaData>>
 create_tokenizer_from_config(const std::shared_ptr<void>& shared_object_ov_tokenizers,
                              const std::filesystem::path& gguf_model_path);
@@ -40,8 +45,8 @@ const T* get_if_exist(const std::map<std::string, GGUFMetaData>& tokenizer_confi
  * be consistent with chat template stored in the original tokenizer_config.json of huggingface models.
  * If certain mismatched pattern found, then the pattern will be replaced with a specific substring.
  * Otherwise, the original chat template is returned.
- * Current this function is used to patch the chat template for Qwen2.5 models, but the logic can be extended to other
- * models
+ * Currently this function patches chat templates for Qwen2.5 and Qwen3 models; the logic can be
+ * extended to other models.
  *
  *
  * Example: The function finds the substring for Qwen2.5:

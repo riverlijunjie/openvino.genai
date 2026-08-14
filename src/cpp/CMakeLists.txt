@@ -236,6 +236,15 @@ target_include_directories(${TARGET_NAME_OBJ} SYSTEM PRIVATE "${safetensors.h_SO
 
 target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino::runtime openvino::threading nlohmann_json::nlohmann_json minja)
 
+# The GGUF loading path includes OpenVINO developer headers (ov_ops/, transformations/),
+# which live on openvino::runtime::dev rather than the public openvino::runtime target. That target
+# is only available when the OpenVINO developer package is found; link it so the dev include dirs
+# (e.g. src/common/transformations/include holding ov_ops/fully_connected_compressed.hpp) are on
+# this target's include path.
+if(TARGET openvino::runtime::dev)
+    target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino::runtime::dev)
+endif()
+
 if(OPENVINO_GENAI_HAS_MISAKI_CPP)
     target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino_genai_misaki_cpp)
     target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE OPENVINO_GENAI_HAS_MISAKI_CPP=1)

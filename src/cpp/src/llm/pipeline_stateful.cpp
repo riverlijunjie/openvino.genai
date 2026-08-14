@@ -4,6 +4,8 @@
 
 #include "llm/pipeline_stateful.hpp"
 
+#include "openvino/runtime/properties.hpp"
+
 #include "lora/helper.hpp"
 #include "lm_encoding.hpp"
 #include "openvino/genai/text_streamer.hpp"
@@ -11,6 +13,37 @@
 #include "utils.hpp"
 
 namespace ov::genai {
+
+namespace {
+
+ov::AnyMap with_cache_model_path(const ov::AnyMap& properties,
+                                 const std::filesystem::path& model_path) {
+    ov::AnyMap updated = properties;
+    if (updated.find(ov::cache_model_path.name()) == updated.end() && !model_path.empty()) {
+        updated[ov::cache_model_path.name()] = model_path;
+    }
+    return updated;
+}
+
+void normalize_cache_property_keys(ov::AnyMap& properties) {
+    // Core model-cache parsing checks canonical property names.
+    // Keep backward compatibility for callers that still pass lowercase keys.
+    auto lower_cache_dir_it = properties.find("cache_dir");
+    if (properties.find(ov::cache_dir.name()) == properties.end() &&
+        lower_cache_dir_it != properties.end()) {
+        properties[ov::cache_dir.name()] = lower_cache_dir_it->second;
+        properties.erase(lower_cache_dir_it);
+    }
+
+    auto lower_cache_model_path_it = properties.find("cache_model_path");
+    if (properties.find(ov::cache_model_path.name()) == properties.end() &&
+        lower_cache_model_path_it != properties.end()) {
+        properties[ov::cache_model_path.name()] = lower_cache_model_path_it->second;
+        properties.erase(lower_cache_model_path_it);
+    }
+}
+
+}  // namespace
 
 StatefulLLMPipeline::StatefulLLMPipeline(
     const ov::InferRequest& request,
@@ -36,7 +69,7 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         utils::read_model(models_path, properties),
         tokenizer,
         device,
-        properties,
+        with_cache_model_path(properties, models_path),
         utils::from_config_json_if_exists(models_path)
     } {}
 
@@ -65,6 +98,7 @@ StatefulLLMPipeline::StatefulLLMPipeline(
 
     auto [filtered_properties_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties);
     auto filtered_properties = extract_adapters_from_properties(filtered_properties_without_gguf, &m_generation_config.adapters);
+    normalize_cache_property_keys(filtered_properties.fork());
     if (m_generation_config.adapters) {
         m_generation_config.adapters->set_tensor_name_prefix("base_model.model.");
         m_adapter_controller = AdapterController(model, *m_generation_config.adapters, device);   // TODO: Make the prefix name configurable
@@ -74,11 +108,36 @@ StatefulLLMPipeline::StatefulLLMPipeline(
         utils::KVDesc kv_desc;
         std::tie(compiled_model, kv_desc) = utils::compile_decoder_for_npu(model, *filtered_properties, kv_pos);
         m_max_prompt_len = kv_desc.max_prompt_len;
+        m_max_kv_cache_size = kv_desc.max_prompt_len + kv_desc.min_response_len;
     } else {
-       compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
+        compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
     }
     m_model_runner = compiled_model.create_infer_request();
+    // Ensure deterministic first request regardless of how compiled model was obtained
+    // (cold compile vs imported from model cache blob).
+    try {
+        m_model_runner.reset_state();
+    } catch (...) {
+        // Best-effort: some models may not expose state variables.
+    }
+    try {
+        m_model_runner.get_tensor("attention_mask").set_shape({1, 0});
+    } catch (...) {
+        // Best-effort: not all models expose attention_mask as a mutable state tensor.
+    }
+
     ov::genai::utils::print_compiled_model_properties(compiled_model, "Stateful LLM model");
+
+    // Detect if model uses 3D position_ids (MRoPE like Qwen3.5)
+    for (const auto& input : compiled_model.inputs()) {
+        if (input.get_any_name() == "position_ids") {
+            auto pshape = input.get_partial_shape();
+            if (pshape.rank().is_static() && pshape.rank().get_length() == 3) {
+                m_has_3d_position_ids = true;
+            }
+            break;
+        }
+    }
 
     // If eos_token_id was not provided, take value
     if (m_generation_config.eos_token_id == -1)

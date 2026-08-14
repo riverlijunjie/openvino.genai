@@ -6,6 +6,7 @@
 
 #include "gguf_tokenizer.hpp"
 
+#include "utils.hpp"
 #include "openvino/op/add.hpp"
 #include "openvino/op/constant.hpp"
 #include "openvino/op/convert.hpp"
@@ -50,6 +51,64 @@ std::map<std::string, GGUFMetaData> tokenizer_config_from_meta(
             std::string sub_key = (last_dot != std::string_view::npos) ? std::string(key.substr(last_dot + 1)) : key;
             tokenizer_config[sub_key] = value;
         }
+    }
+
+    return tokenizer_config;
+}
+
+std::map<std::string, GGUFMetaData> tokenizer_config_from_meta(const ov::Model& model) {
+    // Source the tokenizer metadata from the native GGUF FrontEnd rt-info schema
+    // instead of re-parsing the .gguf file. Keys live under the variadic "gguf" top segment.
+    std::map<std::string, GGUFMetaData> tokenizer_config;
+
+    auto has = [&](std::initializer_list<std::string> path) {
+        return model.has_rt_info(std::vector<std::string>(path));
+    };
+    if (has({"gguf", "tokenizer", "ggml", "model"})) {
+        tokenizer_config["model"] = model.get_rt_info<std::string>("gguf", "tokenizer", "ggml", "model");
+    }
+    if (has({"gguf", "tokenizer", "ggml", "pre"})) {
+        tokenizer_config["pre"] = model.get_rt_info<std::string>("gguf", "tokenizer", "ggml", "pre");
+    }
+    if (has({"gguf", "tokenizer", "ggml", "tokens"})) {
+        tokenizer_config["tokens"] =
+            model.get_rt_info<std::vector<std::string>>("gguf", "tokenizer", "ggml", "tokens");
+    }
+    if (has({"gguf", "tokenizer", "ggml", "merges"})) {
+        tokenizer_config["merges"] =
+            model.get_rt_info<std::vector<std::string>>("gguf", "tokenizer", "ggml", "merges");
+    }
+    // token_type and scores are consumed downstream as ov::Tensor (matching the in-tree reader's
+    // GGUFMetaData variant, which has no vector<float>); materialize the rt-info vectors into tensors.
+    if (has({"gguf", "tokenizer", "ggml", "token_type"})) {
+        const auto tt = model.get_rt_info<std::vector<int32_t>>("gguf", "tokenizer", "ggml", "token_type");
+        ov::Tensor t(ov::element::i32, ov::Shape{tt.size()});
+        std::copy(tt.begin(), tt.end(), t.data<int32_t>());
+        tokenizer_config["token_type"] = t;
+    }
+    if (has({"gguf", "tokenizer", "ggml", "scores"})) {
+        const auto sc = model.get_rt_info<std::vector<float>>("gguf", "tokenizer", "ggml", "scores");
+        ov::Tensor t(ov::element::f32, ov::Shape{sc.size()});
+        std::copy(sc.begin(), sc.end(), t.data<float>());
+        tokenizer_config["scores"] = t;
+    }
+    // bos/eos token ids are consumed downstream as ov::Tensor<uint32_t> (tokenizer_impl.cpp), so
+    // materialize a 1-element u32 tensor rather than a scalar int.
+    auto u32_tensor = [](uint32_t v) {
+        ov::Tensor t(ov::element::u32, ov::Shape{1});
+        t.data<uint32_t>()[0] = v;
+        return t;
+    };
+    if (has({"gguf", "tokenizer", "ggml", "bos_token_id"})) {
+        tokenizer_config["bos_token_id"] =
+            u32_tensor(model.get_rt_info<uint32_t>("gguf", "tokenizer", "ggml", "bos_token_id"));
+    }
+    if (has({"gguf", "tokenizer", "ggml", "eos_token_id"})) {
+        tokenizer_config["eos_token_id"] =
+            u32_tensor(model.get_rt_info<uint32_t>("gguf", "tokenizer", "ggml", "eos_token_id"));
+    }
+    if (has({"gguf", "tokenizer", "chat_template"})) {
+        tokenizer_config["chat_template"] = model.get_rt_info<std::string>("gguf", "tokenizer", "chat_template");
     }
 
     return tokenizer_config;
@@ -125,7 +184,6 @@ bool is_special_token(int32_t token_type) {
 std::string quote_meta(const std::string& str) {
     std::string result = "(";
     
-    // todo: add also utf validate
     for (char c : str) {
         if (!std::isalnum(c) && c != '_') {
             result += '\\';
@@ -149,16 +207,20 @@ std::string join_special_tokens(const std::vector<std::string>& special_tokens) 
 std::vector<std::string> get_split_regex(const std::string& pre) {
     // taken from
     // https://github.com/ggml-org/llama.cpp/blob/8551c44d840a7db50adb958ccaf464dc3ded82e7/src/llama-vocab.cpp#L279
-    // TODO: complete for other archs
+    // Only the pre-tokenizer families listed below have model-specific patterns; unknown values
+    // use the generic expressions defined after the map.
+    // The Qwen2 pattern is also used for the "qwen35" pre-tokenizer value reported by supported
+    // Qwen3.5 GGUFs. Other values not listed below use the generic expressions.
+    static const std::vector<std::string> qwen2_regex = {
+        // original regex from tokenizer.json
+        // "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}|
+        // ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| "
+        "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    };
     static std::unordered_map<std::string, std::vector<std::string>> regex_map = {
-        {"qwen2",
-         {
-             // original regex from tokenizer.json
-             // "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}|
-             // ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
-             "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| "
-             "?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
-         }},
+        {"qwen2", qwen2_regex},
+        {"qwen35", qwen2_regex},
         {"smollm",
          {
              "\\p{N}",
@@ -446,8 +508,24 @@ ov::OutputVector parse_bbpe_config(const std::map<std::string, GGUFMetaData>& to
 std::tuple<std::shared_ptr<ov::Model>, std::shared_ptr<ov::Model>, std::map<std::string, GGUFMetaData>>
 create_tokenizer_from_config(const std::shared_ptr<void>& shared_object_ov_tokenizers,
                              const std::filesystem::path& gguf_model_path) {
-    auto gguf_metadata = std::get<0>(get_gguf_data(gguf_model_path.string()));
-    auto tokenizer_config = tokenizer_config_from_meta(gguf_metadata);
+    std::map<std::string, GGUFMetaData> tokenizer_config;
+    // When the native GGUF FrontEnd is enabled (not default), source the tokenizer config from the
+    // ov::Model rt-info via Core::read_model instead of re-parsing the .gguf with the in-tree reader.
+    // The GGUF FE in this build (river/native_gguf_support) does NOT support direct GGUF->model
+    // conversion (its convert() throws); fall back to the in-tree parser on that path.
+    if (utils::env_bool("OPENVINO_GENAI_USE_NATIVE_GGUF_FE", /*default=*/false)) {
+        try {
+            auto model = utils::singleton_core().read_model(gguf_model_path);
+            tokenizer_config = tokenizer_config_from_meta(*model);
+        } catch (const ov::Exception&) {
+            // Native FE does not support direct GGUF conversion in this build; use in-tree parser.
+            auto gguf_metadata = std::get<0>(get_gguf_data(gguf_model_path.string(), true));
+            tokenizer_config = tokenizer_config_from_meta(gguf_metadata);
+        }
+    } else {
+        auto gguf_metadata = std::get<0>(get_gguf_data(gguf_model_path.string(), true));
+        tokenizer_config = tokenizer_config_from_meta(gguf_metadata);
+    }
 
     auto tokenizer_input = std::make_shared<v0::Parameter>(element::string, PartialShape{Dimension::dynamic()});
 

@@ -315,8 +315,7 @@ ov::Output<ov::Node> make_rms_norm_qwen3(
     return mul;
 }
 
-// Helper function to split heads
-// There are q_norm k_norm in Qwen3, if key_name + ".self_attn.q_norm" + ".weight" exists, a rms_norm will be built, if not it will go to else branch.
+// Split heads and apply per-head RMSNorm when the corresponding q_norm/k_norm weight exists.
 std::shared_ptr<v1::Transpose> split_heads(const Output<Node>& x,
                                             int num_h,
                                             int  head_dim,
@@ -325,12 +324,12 @@ std::shared_ptr<v1::Transpose> split_heads(const Output<Node>& x,
                                             const std::unordered_map<std::string, ov::Tensor>& weights) {
     auto shape = std::make_shared<v0::Constant>(element::i64, Shape{4}, std::vector<int64_t>{0, 0, num_h, head_dim});
     auto reshaped = std::make_shared<v1::Reshape>(x, shape, true);
-    if (weights.count(key + ".weight")) { //Qwen3 rms_norm
+    if (weights.count(key + ".weight")) {
         auto mul = make_rms_norm_qwen3(key, reshaped, weights, rms_norm_eps);
         auto transpose_order = std::make_shared<v0::Constant>(element::i32, Shape{4}, std::vector<int32_t>{0, 2, 1, 3});
         
         return std::make_shared<v1::Transpose>(mul, transpose_order);
-    } else { //none-Qwen3 architecture
+    } else {
         auto transpose_order = std::make_shared<v0::Constant>(element::i32, Shape{4}, std::vector<int32_t>{0, 2, 1, 3});
         return std::make_shared<v1::Transpose>(reshaped, transpose_order);
     } 
@@ -484,8 +483,7 @@ multi_head_attention(
     };
 }
 
-// TODO: can be issues with allocated memory
-// TODO: rewrite without doubling a memory
+// Reordering allocates a second tensor because the source and destination rows can overlap.
 ov::Tensor reorder_interleaved_format(const ov::Tensor& weights, int head_size) {
     ov::Shape input_shape = weights.get_shape();
     if (input_shape.empty() || input_shape[0] % head_size != 0) {
@@ -834,7 +832,6 @@ std::tuple<ov::Output<ov::Node>, ov::Output<ov::Node>> make_embedding(
     gguf_tensor_type qtype) {
         
     auto embedding_type = qtype;
-    // Detmbedding_type = qtype;
     if (consts.count(key + ".scales") == 0) {
         embedding_type = gguf_tensor_type::GGUF_TYPE_F16;
     }
